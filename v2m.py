@@ -22,6 +22,9 @@ CONFIG_FILE = "volcano_config.json"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("VolcanoMQTT")
 
+# Bluetooth client state
+bluetooth_client = None
+
 
 class MessageQueue:
     def __init__(self):
@@ -65,53 +68,81 @@ async def mqtt_listener(client, message_queue, loop):
     client.on_message = on_message
 
 
-async def connect_bluetooth(mqtt_client):
-    logger.info("Connecting to Bluetooth device with a timeout...")
-    try:
-        # Discover devices with 'volcano' in their name
-        devices = await BleakScanner.discover()
-        volcano_devices = [
-            device for device in devices if device.name and "volcano" in device.name.lower()
-        ]
-        
-        if volcano_devices:
-            # Connect to the first available volcano device
-            device = volcano_devices[0]
-            logger.info(f"Connecting to Bluetooth device: {device.name} ({device.address})")
-            async with BleakClient(device.address) as client:
-                logger.info(f"Connected to {device.name}")
-                await publish_auto_discovery(mqtt_client, device)
-                await read_temperature(client, mqtt_client)
-        else:
-            logger.error("No Bluetooth devices with 'volcano' in the name were found.")
-    except Exception as e:
-        logger.error(f"Bluetooth connection failed: {e}")
+def clear_retained_message(mqtt_client, topic):
+    """Clear retained message for a specific MQTT topic."""
+    mqtt_client.publish(topic, payload=None, retain=True)
+    logger.info(f"Cleared retained message for topic {topic}")
 
 
 async def publish_auto_discovery(mqtt_client, device):
     """Publish auto-discovery message to HA for the Current Temperature sensor."""
+    # Using the same identifiers as the connect button
     discovery_topic = f"{DISCOVERY_PREFIX}/sensor/volcano_vaporiser_current_temperature/config"
+    
+    # Clear retained message for the discovery topic before publishing
+    clear_retained_message(mqtt_client, discovery_topic)
+    
+    # Discovery payload for current temperature
     discovery_payload = {
         "name": "Volcano Vaporiser Current Temperature",
-        "state_topic": "homeassistant/sensor/volcano_vaporiser_current_temperature/state",  # Updated state_topic
+        "unique_id": "volcano_vaporiser_current_temperature",  # Unique ID for the sensor
+        "state_topic": "homeassistant/sensor/volcano_vaporiser_current_temperature/state",  # State topic for temperature updates
         "unit_of_measurement": "°C",
-        "value_template": "{{ value_json.temperature }}",
+        "value_template": "{{ value_json.temperature }}",  # Template to extract temperature from payload
         "device": {
-            "identifiers": [f"{device.address}"],
-            "name": "Volcano Vaporiser",
-            "manufacturer": "S&B",
+            "identifiers": ["volcano_device"],  # Shared identifier for all devices
+            "name": "Volcano Vaporiser",  # Name of the device
+            "manufacturer": "Storz & Bickel",
             "model": "Volcano Vaporiser",
             "sw_version": "1.0",
         },
     }
+    
+    # Publish the auto-discovery message
     mqtt_client.publish(discovery_topic, json.dumps(discovery_payload), retain=True)
     logger.info("Published MQTT auto-discovery message for Current Temperature.")
 
 
+async def publish_button_discovery(mqtt_client, button_name, button_topic, unique_id):
+    """Publish auto-discovery message for a button (connect/disconnect)."""
+    discovery_topic = f"homeassistant/button/{unique_id}/config"
+    discovery_payload = {
+        "name": button_name,
+        "unique_id": unique_id,
+        "command_topic": button_topic,
+        "device": {
+            "identifiers": ["volcano_device"],  # Shared identifier for all devices (temperature sensor and buttons)
+            "name": "Volcano Vaporiser",
+            "model": "Storz & Bickel Volcano",
+            "manufacturer": "Storz & Bickel",
+            "sw_version": "1.0",  # Include sw_version here as well
+        }
+    }
+    mqtt_client.publish(discovery_topic, json.dumps(discovery_payload), retain=True)
+    logger.info(f"Published auto-discovery message for {button_name}.")
+
+
+async def publish_bluetooth_status_discovery(mqtt_client):
+    """Publish auto-discovery message for Bluetooth status sensor."""
+    discovery_topic = "homeassistant/sensor/volcano_bluetooth_status/config"
+    discovery_payload = {
+        "name": "Bluetooth Status",
+        "unique_id": "volcano_bluetooth_status",
+        "state_topic": "homeassistant/sensor/volcano_bluetooth_status/state",
+        "device": {
+            "identifiers": ["volcano_device"],
+            "name": "Volcano Vaporiser",
+            "model": "Storz & Bickel Volcano",
+            "manufacturer": "Storz & Bickel"
+        }
+    }
+    mqtt_client.publish(discovery_topic, json.dumps(discovery_payload), retain=True)
+    logger.info("Published MQTT auto-discovery message for Bluetooth status.")
+
 
 async def read_temperature(client, mqtt_client):
     """Reads and publishes the temperature every second."""
-    while True:
+    while bluetooth_client:
         try:
             logger.info("Attempting to read temperature from Bluetooth device...")
             value = await client.read_gatt_char(CURRENT_TEMPERATURE_UUID)
@@ -136,21 +167,44 @@ async def read_temperature(client, mqtt_client):
         await asyncio.sleep(1)
 
 
+async def connect_bluetooth(mqtt_client):
+    """Connect to the Bluetooth device."""
+    global bluetooth_client
+    logger.info("Connecting to Bluetooth device with a timeout...")
+    try:
+        # Discover devices with 'volcano' in their name
+        devices = await BleakScanner.discover()
+        volcano_devices = [
+            device for device in devices if device.name and "volcano" in device.name.lower()
+        ]
+        
+        if volcano_devices:
+            # Connect to the first available volcano device
+            device = volcano_devices[0]
+            logger.info(f"Connecting to Bluetooth device: {device.name} ({device.address})")
+            async with BleakClient(device.address) as client:
+                bluetooth_client = client  # Store client reference globally
+                logger.info(f"Connected to {device.name}")
+                await publish_auto_discovery(mqtt_client, device)
+                await read_temperature(client, mqtt_client)
+        else:
+            logger.error("No Bluetooth devices with 'volcano' in the name were found.")
+    except Exception as e:
+        logger.error(f"Bluetooth connection failed: {e}")
+
 
 async def disconnect_bluetooth():
-    logger.info("Disconnecting from Bluetooth device...")
-    # Add Bluetooth disconnection logic here
-
-
-async def bluetooth_worker(config, message_queue, mqtt_client):
-    while True:
-        coro = await message_queue.queue.get()
-        try:
-            await coro()
-        except Exception as e:
-            logger.error(f"Bluetooth error: {e}")
-        finally:
-            message_queue.queue.task_done()
+    """Disconnect from Bluetooth device."""
+    global bluetooth_client
+    if bluetooth_client:
+        logger.info("Disconnecting from Bluetooth device...")
+        await bluetooth_client.disconnect()
+        bluetooth_client = None
+        logger.info("Disconnected from Bluetooth device.")
+        # Update Bluetooth status in MQTT
+        mqtt_client.publish("homeassistant/sensor/volcano_bluetooth_status/state", "Disconnected")
+    else:
+        logger.info("No Bluetooth client connected.")
 
 
 async def main():
@@ -175,22 +229,16 @@ async def main():
     asyncio.create_task(message_queue.process())
     asyncio.create_task(mqtt_listener(mqtt_client, message_queue, loop))
 
-    await connect_bluetooth(mqtt_client)
+    try:
+        await connect_bluetooth(mqtt_client)  # Start by connecting to Bluetooth
+        await asyncio.Event().wait()  # Keep the program running until shutdown
 
-    def shutdown():
-        logger.info("Shutting down...")
+    except asyncio.CancelledError:
+        logger.info("Application terminating gracefully...")
+
+    finally:
         mqtt_client.loop_stop()
         mqtt_client.disconnect()
-        for task in asyncio.all_tasks():
-            task.cancel()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda *_: shutdown())
-
-    try:
-        await asyncio.Event().wait()  # Run until interrupted
-    except asyncio.CancelledError:
-        logger.info("Application terminated.")
 
 
 if __name__ == "__main__":
