@@ -1,0 +1,9 @@
+# Ignore all JSON files
+*.json
+
+# Ignore all LOG files
+*.log
+
+# Ignore log and json files in all subdirectories
+**/*.json
+**/*.log
